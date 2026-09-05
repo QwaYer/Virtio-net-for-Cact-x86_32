@@ -13,21 +13,21 @@
 #include "net.h"
 
 /* ── kernel entry points (resolved via ksym at load time) ───────── */
-extern void kprint(char* s);
-extern void kprint_hex(uint32_t v);
+extern void printk(const char* fmt, ...);
+extern void printk_hex(uint32_t v);
 extern void* kmalloc_aligned(uint32_t size, uint32_t align);
-extern void kfree_aligned(void* p);
-extern uint32_t pci_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg);
-extern void pci_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg,
+extern void kfree(void* p);
+extern uint32_t pci_read_config_dword(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg);
+extern void pci_write_config_dword(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg,
                         uint32_t val);
-extern uint8_t  port_byte_in(uint16_t port);
-extern void     port_byte_out(uint16_t port, uint8_t val);
-extern void     port_word_out(uint16_t port, uint16_t val);
-extern uint32_t port_long_in(uint16_t port);
-extern void     port_long_out(uint16_t port, uint32_t val);
-extern void     net_register_driver(net_driver_t* drv);
-extern void     net_unregister_driver(net_driver_t* drv);
-extern void     net_receive(skb_t* skb);
+extern uint8_t  inb(uint16_t port);
+extern void     outb(uint16_t port, uint8_t val);
+extern void     outw(uint16_t port, uint16_t val);
+extern uint32_t inl(uint16_t port);
+extern void     outl(uint16_t port, uint32_t val);
+extern void     register_netdev(net_driver_t* drv);
+extern void     unregister_netdev(net_driver_t* drv);
+extern void     netif_rx(skb_t* skb);
 extern void*    memset(void* s, int c, size_t n);
 
 /* MSI-X table entry struct (must match kernel's msi.h) */
@@ -51,9 +51,9 @@ extern int      pci_msix_enable(pci_device_t *dev, int vec,
                                 unsigned int entry_idx);
 extern void     net_driver_irq_wake(void);
 /* log_level_t: LOG_OK=0 LOG_WARN=1 LOG_ERROR=2 LOG_FAIL=3 (kernel.h) */
-extern void     klog(int level, const char* message);
+
 extern skb_t*   skb_alloc(void);
-extern void     skb_free(skb_t* skb);
+extern void     kfree_skb(skb_t* skb);
 extern uint8_t* skb_push(skb_t* skb, uint16_t len);
 extern uint8_t* skb_data(skb_t* skb);
 extern uint16_t skb_len(skb_t* skb);
@@ -87,10 +87,6 @@ typedef struct {
 static virtqueue_t vq_rx;
 static virtqueue_t vq_tx;
 
-#define KLOG_OK    0
-#define KLOG_WARN  1
-#define KLOG_ERROR 2
-#define KLOG_FAIL  3
 
 static uint32_t align_up(uint32_t addr, uint32_t align) {
     return (addr + align - 1) & ~(align - 1);
@@ -124,14 +120,14 @@ static void virtq_alloc(virtqueue_t* vq, uint16_t size) {
 }
 
 static void virtq_activate(virtqueue_t* vq, uint16_t queue_idx) {
-    port_word_out(io_base + VIRTIO_PCI_QUEUE_SELECT, queue_idx);
+    outw(io_base + VIRTIO_PCI_QUEUE_SELECT, queue_idx);
     uint32_t pfn = (uint32_t)(uintptr_t)vq->desc / 4096;
-    port_long_out(io_base + VIRTIO_PCI_QUEUE_PFN, pfn);
+    outl(io_base + VIRTIO_PCI_QUEUE_PFN, pfn);
 }
 
 static void virtq_deactivate(uint16_t queue_idx) {
-    port_word_out(io_base + VIRTIO_PCI_QUEUE_SELECT, queue_idx);
-    port_long_out(io_base + VIRTIO_PCI_QUEUE_PFN, 0);
+    outw(io_base + VIRTIO_PCI_QUEUE_SELECT, queue_idx);
+    outl(io_base + VIRTIO_PCI_QUEUE_PFN, 0);
 }
 
 
@@ -139,7 +135,7 @@ static void virtq_deactivate(uint16_t queue_idx) {
 static void virtio_net_free_rx_skbs(void) {
     for (int i = 0; i < VIRTQ_MAX_SIZE; i++) {
         if (vq_rx.rx_skbs[i]) {
-            skb_free(vq_rx.rx_skbs[i]);
+            kfree_skb(vq_rx.rx_skbs[i]);
             vq_rx.rx_skbs[i] = NULL;
         }
     }
@@ -188,7 +184,7 @@ static void rx_fill(void) {
         __asm__ __volatile__("" ::: "memory");
         vq_rx.avail->idx++;
     }
-    port_word_out(io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_NET_QUEUE_RX);
+    outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_NET_QUEUE_RX);
 }
 
 static int virtio_net_send(skb_t* skb) {
@@ -213,7 +209,7 @@ static int virtio_net_send(skb_t* skb) {
     __asm__ __volatile__("" ::: "memory");
     vq_tx.avail->idx++;
 
-    port_word_out(io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_NET_QUEUE_TX);
+    outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, VIRTIO_NET_QUEUE_TX);
     return 0;
 }
 
@@ -235,7 +231,7 @@ static void virtio_net_drain_rx(void) {
             desc_free(&vq_rx, d1);
             desc_free(&vq_rx, d0);
 
-            net_receive(skb);
+            netif_rx(skb);
         }
     }
 
@@ -253,13 +249,13 @@ static void virtio_net_poll(void) { virtio_net_drain_rx(); }
 
 static void virtio_net_irq_handler(void) {
     if (!virtio_net_ready || io_base == 0) return;
-    port_byte_in(io_base + VIRTIO_PCI_ISR);
+    inb(io_base + VIRTIO_PCI_ISR);
     net_driver_irq_wake();
 }
 
 static void virtio_net_get_mac(mac_addr_t* out) {
     for (int i = 0; i < 6; i++)
-        out->b[i] = port_byte_in(io_base + VIRTIO_PCI_NET_MAC + i);
+        out->b[i] = inb(io_base + VIRTIO_PCI_NET_MAC + i);
 }
 
 static net_driver_t virtio_driver = {
@@ -281,27 +277,27 @@ static void virtio_detach(void) {
     }
 
     if (virtio_net_ready) {
-        net_unregister_driver(&virtio_driver);
+        unregister_netdev(&virtio_driver);
         virtio_net_ready = 0;
     }
 
     if (io_base != 0) {
         virtq_deactivate(VIRTIO_NET_QUEUE_RX);
         virtq_deactivate(VIRTIO_NET_QUEUE_TX);
-        port_byte_out(io_base + VIRTIO_PCI_STATUS, 0);
+        outb(io_base + VIRTIO_PCI_STATUS, 0);
     }
 
     if (vnet_bus || vnet_dev || vnet_fn)
-        pci_write32(vnet_bus, vnet_dev, vnet_fn, 0x04, vnet_saved_pci_cmd_dw);
+        pci_write_config_dword(vnet_bus, vnet_dev, vnet_fn, 0x04, vnet_saved_pci_cmd_dw);
 
     virtio_net_free_rx_skbs();
 
     if (vq_rx.desc) {
-        kfree_aligned(vq_rx.desc);
+        kfree(vq_rx.desc);
         memset(&vq_rx, 0, sizeof(vq_rx));
     }
     if (vq_tx.desc) {
-        kfree_aligned(vq_tx.desc);
+        kfree(vq_tx.desc);
         memset(&vq_tx, 0, sizeof(vq_tx));
     }
 
@@ -310,7 +306,7 @@ static void virtio_detach(void) {
     vnet_saved_pci_cmd_dw = 0;
 
     if (had_any)
-        klog(KLOG_OK, "virtio-net (kmod): unloaded");
+        printk("6" "virtio-net (kmod): unloaded");
 }
 
 int pci_driver_probe(pci_device_t* dev) {
@@ -318,17 +314,16 @@ int pci_driver_probe(pci_device_t* dev) {
 
     virtio_detach();
 
-    kprint((char*)"[virtio_net mod] probe bus=");
-    kprint_hex(dev->bus);
-    kprint((char*)" dev=");
-    kprint_hex(dev->dev);
-    kprint((char*)" fn=");
-    kprint_hex(dev->fn);
-    kprint((char*)"\n");
+    printk((char*)"[virtio_net mod] probe bus=");
+    printk_hex(dev->bus);
+    printk((char*)" dev=");
+    printk_hex(dev->dev);
+    printk((char*)" fn=");
+    printk_hex(dev->fn);
+    printk((char*)"\n");
 
     if (!dev->bars[0].is_io || dev->bars[0].base == 0) {
-        klog(KLOG_FAIL,
-             "virtio-net (kmod): BAR0 not I/O — need legacy virtio (e.g. virtio-net-pci,disable-modern=on)");
+        printk("3" "virtio-net (kmod): BAR0 not I/O — need legacy virtio (e.g. virtio-net-pci,disable-modern=on)");
         return -1;
     }
 
@@ -337,34 +332,34 @@ int pci_driver_probe(pci_device_t* dev) {
     vnet_dev = dev->dev;
     vnet_fn  = dev->fn;
 
-    vnet_saved_pci_cmd_dw = pci_read32(vnet_bus, vnet_dev, vnet_fn, 0x04);
+    vnet_saved_pci_cmd_dw = pci_read_config_dword(vnet_bus, vnet_dev, vnet_fn, 0x04);
     uint16_t cmd = (uint16_t)(vnet_saved_pci_cmd_dw & 0xFFFFu);
-    pci_write32(vnet_bus, vnet_dev, vnet_fn, 0x04, cmd | 0x05);
+    pci_write_config_dword(vnet_bus, vnet_dev, vnet_fn, 0x04, cmd | 0x05);
 
-    port_byte_out(io_base + VIRTIO_PCI_STATUS, 0);
-    port_byte_out(io_base + VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
-    port_byte_out(io_base + VIRTIO_PCI_STATUS,
+    outb(io_base + VIRTIO_PCI_STATUS, 0);
+    outb(io_base + VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+    outb(io_base + VIRTIO_PCI_STATUS,
                   VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
-    uint32_t host_feat = port_long_in(io_base + VIRTIO_PCI_HOST_FEATURES);
+    uint32_t host_feat = inl(io_base + VIRTIO_PCI_HOST_FEATURES);
     uint32_t our_feat  = host_feat & (VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
-    port_long_out(io_base + VIRTIO_PCI_GUEST_FEATURES, our_feat);
+    outl(io_base + VIRTIO_PCI_GUEST_FEATURES, our_feat);
 
     virtq_alloc(&vq_rx, VIRTQ_MAX_SIZE);
     virtq_alloc(&vq_tx, VIRTQ_MAX_SIZE);
     if (!vq_rx.desc || !vq_tx.desc) {
-        klog(KLOG_FAIL, "virtio-net (kmod): virtqueue allocation failed");
+        printk("3" "virtio-net (kmod): virtqueue allocation failed");
         virtio_detach();
         return -1;
     }
 
     virtq_activate(&vq_rx, VIRTIO_NET_QUEUE_RX);
     virtq_activate(&vq_tx, VIRTIO_NET_QUEUE_TX);
-    port_byte_out(io_base + VIRTIO_PCI_STATUS,
+    outb(io_base + VIRTIO_PCI_STATUS,
                   VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
 
     virtio_net_get_mac(&virtio_driver.mac);
-    net_register_driver(&virtio_driver);
+    register_netdev(&virtio_driver);
     rx_fill();
 
     vnet_msix_vector = -1;
@@ -383,21 +378,21 @@ int pci_driver_probe(pci_device_t* dev) {
         }
     }
     if (vnet_msix_vector < 0) {
-        klog(KLOG_WARN, "virtio-net (kmod): MSI-X unavailable — poll-only");
+        printk("4" "virtio-net (kmod): MSI-X unavailable — poll-only");
         vnet_irq_armed = 0;
     }
 
     virtio_net_ready = 1;
 
-    kprint((char*)"\n*** virtio-net (kmod): SUCCESS — NIC online ***\n");
-    kprint((char*)"    MAC ");
+    printk((char*)"\n*** virtio-net (kmod): SUCCESS — NIC online ***\n");
+    printk((char*)"    MAC ");
     for (int i = 0; i < 6; i++) {
-        if (i) kprint((char*)":");
-        kprint_hex(virtio_driver.mac.b[i]);
+        if (i) printk((char*)":");
+        printk_hex(virtio_driver.mac.b[i]);
     }
-    kprint((char*)"\n");
+    printk((char*)"\n");
 
-    klog(KLOG_OK, "virtio-net (kmod): driver attached — network stack ready");
+    printk("6" "virtio-net (kmod): driver attached — network stack ready");
     return 0;
 }
 
