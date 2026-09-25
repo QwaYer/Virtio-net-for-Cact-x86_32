@@ -30,25 +30,8 @@ extern void     unregister_netdev(net_driver_t* drv);
 extern void     netif_rx(skb_t* skb);
 extern void*    memset(void* s, int c, size_t n);
 
-/* MSI-X table entry struct (must match kernel's msi.h) */
-struct msix_table_entry {
-    uint32_t msg_addr_lo;
-    uint32_t msg_addr_hi;
-    uint32_t msg_data;
-    uint32_t vector_ctrl;
-} __attribute__((packed));
-
-extern int      msix_alloc_vector(void);
-extern void     msix_free_vector(int vec);
-extern int      msix_register_handler(int vec, void (*handler)(void));
-extern void     msix_unregister_handler(int vec);
-extern int      pci_msix_support(pci_device_t *dev);
-extern int      pci_msix_table_map(pci_device_t *dev,
-                                   volatile struct msix_table_entry **table_out,
-                                   uint32_t *table_size_out);
-extern int      pci_msix_enable(pci_device_t *dev, int vec,
-                                volatile struct msix_table_entry *table,
-                                unsigned int entry_idx);
+extern int      msidev_register(pci_device_t *dev, void (*handler)(void));
+extern void     msidev_unregister(int vec);
 extern void     net_driver_irq_wake(void);
 /* log_level_t: LOG_OK=0 LOG_WARN=1 LOG_ERROR=2 LOG_FAIL=3 (kernel.h) */
 
@@ -110,6 +93,12 @@ static void virtq_alloc(virtqueue_t* vq, uint16_t size) {
     vq->desc  = (virtq_desc_t*)mem;
     vq->avail = (virtq_avail_t*)(mem + avail_off);
     vq->used  = (virtq_used_t*)(mem + used_off);
+
+    /* kmalloc hands back recycled memory, and the device reads avail/used
+     * headers (flags, idx) before the driver ever writes them — a stale
+     * avail->idx makes it reject the whole queue ("Guest says index N is
+     * available"), so every frame is silently dropped.  Zero the rings. */
+    memset(mem, 0, total);
 
     for (int i = 0; i < size - 1; i++) {
         vq->desc[i].flags = VIRTQ_DESC_F_NEXT;
@@ -270,8 +259,7 @@ static void virtio_detach(void) {
                   vq_tx.desc != NULL || vnet_irq_armed;
 
     if (vnet_msix_vector >= 0) {
-        msix_unregister_handler(vnet_msix_vector);
-        msix_free_vector(vnet_msix_vector);
+        msidev_unregister(vnet_msix_vector);
         vnet_msix_vector = -1;
         vnet_irq_armed   = 0;
     }
@@ -362,23 +350,13 @@ int pci_driver_probe(pci_device_t* dev) {
     register_netdev(&virtio_driver);
     rx_fill();
 
-    vnet_msix_vector = -1;
-    {
-        volatile struct msix_table_entry *table = NULL;
-        uint32_t table_size = 0;
-        int cap = pci_msix_support(dev);
-        if (cap && pci_msix_table_map(dev, &table, &table_size) == 0 && table_size > 0) {
-            int vec = msix_alloc_vector();
-            if (vec > 0) {
-                msix_register_handler(vec, virtio_net_irq_handler);
-                pci_msix_enable(dev, vec, table, 0);
-                vnet_msix_vector = vec;
-                vnet_irq_armed   = 1;
-            }
-        }
-    }
+    /* MSI-X, else MSI: msidev_register() picks the mechanism, allocates the
+     * vector and programs the device. */
+    vnet_msix_vector = msidev_register(dev, virtio_net_irq_handler);
+    if (vnet_msix_vector > 0)
+        vnet_irq_armed = 1;
     if (vnet_msix_vector < 0) {
-        printk("4" "virtio-net (kmod): MSI-X unavailable — poll-only");
+        printk("4" "virtio-net (kmod): no MSI/MSI-X — poll-only");
         vnet_irq_armed = 0;
     }
 
