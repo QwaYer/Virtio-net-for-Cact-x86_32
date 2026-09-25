@@ -6,14 +6,12 @@
   <img src="https://img.shields.io/badge/arch-i686-red.svg?style=for-the-badge" alt="Arch: i686">
   <img src="https://img.shields.io/badge/format-cctk-green.svg?style=for-the-badge" alt="Output: virtio_net.cctk">
   <img src="https://img.shields.io/badge/bus-PCI-blue.svg?style=for-the-badge" alt="PCI virtio">
-  <img src="https://img.shields.io/badge/irq-MSI--X-brightgreen.svg?style=for-the-badge" alt="MSI-X">
+  <img src="https://img.shields.io/badge/irq-MSI--X_or_MSI-brightgreen.svg?style=for-the-badge" alt="MSI-X or MSI">
 </p>
 
 <p align="center">
-  <strong>English.</strong> Legacy <strong>virtio-net</strong> PCI driver (I/O BAR0) → <strong><code>virtio_net.cctk</code></strong>.<br>
-  <strong>2.0.0:</strong> migrated from PIC to <strong>MSI-X</strong>. Include paths updated from <code>Cact/kernel/net</code> → <code>Cact/net</code> to match kernel 2.0.0 directory layout.<br>
-  <strong>Русский.</strong> Драйвер <strong>virtio-net</strong> → <strong><code>virtio_net.cctk</code></strong>.<br>
-  <strong>2.0.0:</strong> переведён на <strong>MSI-X</strong>. Пути включения обновлены под новую структуру ядра.
+  Legacy <strong>virtio-net</strong> PCI driver (I/O BAR0) → <strong><code>virtio_net.cctk</code></strong>.<br>
+  <strong>2.0.0:</strong> migrated from PIC to <strong>MSI-X or MSI</strong>. Include paths updated from <code>Cact/kernel/net</code> → <code>Cact/net</code> to match kernel 2.0.0 directory layout.
 </p>
 
 ---
@@ -23,14 +21,16 @@
 **Recommended — full workspace**
 
 ```sh
-make -C CactOS-x86_32 iso
+ninja -C CactOS-x86_32/build-meson iso
 ```
 
 **Standalone**
 
 ```sh
-make install   # auto-detects ../CactKernel-x86_32 and ../LocalRepoCactOS
-make clean
+meson setup build-meson --cross-file cross/i686-cact-clang.ini
+ninja -C build-meson          # → build-meson/virtio_net.cctk
+ninja -C build-meson stage    # copy into ../LocalRepoCactOS-x86_32/lib/
+ninja -C build-meson clean
 ```
 
-Override paths if needed: `make KERN_ROOT=/custom/path LOCAL_REPO=/custom/path install`.
+Override paths if needed: `meson configure build-meson -Dkern_root=/custom/path -Dlocal_repo=/custom/path`.
