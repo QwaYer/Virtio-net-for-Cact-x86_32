@@ -248,7 +248,7 @@ static void virtio_net_get_mac(mac_addr_t* out) {
 }
 
 static net_driver_t virtio_driver = {
-    .name    = "virtio-net (legacy)",
+    .name    = "eth0",
     .send    = virtio_net_send,
     .poll    = virtio_net_poll,
     .get_mac = virtio_net_get_mac,
